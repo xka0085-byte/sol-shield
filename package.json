@@ -6,7 +6,7 @@
   "files": ["bin/", "src/", "examples/", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/YOUR_USERNAME/sol-shield.git"
+    "url": "git+https://github.com/xka0085-byte/sol-shield.git"
   },
   "bin": {
     "sol-shield": "./bin/sol-shield.js"
