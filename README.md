@@ -107,6 +107,14 @@ The invariant test file includes:
 - Generated tests may need minor edits for complex constructors
 - Best results with standard patterns (ERC20, Vault, etc.)
 
+## Support This Project
+
+If sol-shield helped you catch bugs or saved you time, consider supporting development:
+
+**ETH/Base/Arbitrum/Optimism**: `0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb1`
+
+Your support helps maintain and improve this tool. Thank you! 🙏
+
 ## License
 
 MIT

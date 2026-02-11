@@ -9,7 +9,7 @@
     "url": "git+https://github.com/xka0085-byte/sol-shield.git"
   },
   "bin": {
-    "sol-shield": "./bin/sol-shield.js"
+    "sol-shield": "bin/sol-shield.js"
   },
   "scripts": {
     "start": "node bin/sol-shield.js",
