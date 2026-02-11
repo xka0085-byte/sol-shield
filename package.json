@@ -1,0 +1,27 @@
+{
+  "name": "sol-shield",
+  "version": "0.1.0",
+  "description": "Smart contract security test advisor - auto-discover invariants, generate Foundry tests, detect vulnerabilities",
+  "main": "src/analyzer.js",
+  "files": ["bin/", "src/", "examples/", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_USERNAME/sol-shield.git"
+  },
+  "bin": {
+    "sol-shield": "./bin/sol-shield.js"
+  },
+  "scripts": {
+    "start": "node bin/sol-shield.js",
+    "test": "node bin/sol-shield.js analyze ./examples/Token.sol"
+  },
+  "keywords": ["solidity", "smart-contract", "testing", "security", "foundry", "invariant", "fuzz"],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "@solidity-parser/parser": "^0.20.2",
+    "chalk": "^4.1.2",
+    "commander": "^14.0.3"
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+test-output/
+my-tests/
+*.log
+.DS_Store
