@@ -54,13 +54,14 @@ function detectERC20Invariants(contract, invariants) {
     (v) => v.name === "totalSupply" || v.name === "_totalSupply"
   );
 
+  const lcName = contract.name.toLowerCase();
   invariants.push({
     id: "erc20_supply_conservation",
     severity: CRITICAL,
     title: "Total Supply Conservation",
     description: `${supplyVar.name} must always equal the sum of all ${balVar.name}`,
     pattern: "ERC20 supply integrity",
-    invariantCode: `assertEq(token.${supplyVar.name}(), handler.ghost_balanceSum())`,
+    invariantCode: `assertEq(${lcName}.${supplyVar.name}(), handler.ghost_balanceSum())`,
     ghostVars: [
       {
         name: "ghost_balanceSum",
@@ -76,7 +77,7 @@ function detectERC20Invariants(contract, invariants) {
     title: "No Token Creation From Thin Air",
     description: `${supplyVar.name} can only increase through authorized mint functions`,
     pattern: "ERC20 mint control",
-    invariantCode: `assertLe(token.${supplyVar.name}(), handler.ghost_totalMinted())`,
+    invariantCode: `assertLe(${lcName}.${supplyVar.name}(), handler.ghost_totalMinted())`,
     ghostVars: [
       {
         name: "ghost_totalMinted",
@@ -181,13 +182,14 @@ function detectSupplyInvariants(contract, invariants) {
       (v) => v.name === "balances" || v.name === "deposits" || v.name === "stakes"
     );
 
+    const lcName = contract.name.toLowerCase();
     invariants.push({
       id: "vault_accounting",
       severity: CRITICAL,
       title: "Vault Accounting Integrity",
       description: `${totalVar.name} must equal sum of all ${balVar.name}`,
       pattern: "Vault accounting",
-      invariantCode: `assertEq(vault.${totalVar.name}(), handler.ghost_balanceSum())`,
+      invariantCode: `assertEq(${lcName}.${totalVar.name}(), handler.ghost_balanceSum())`,
       ghostVars: [
         {
           name: "ghost_balanceSum",
@@ -208,7 +210,7 @@ function detectSupplyInvariants(contract, invariants) {
         title: "Contract Solvency",
         description: "Contract ETH balance must be >= totalDeposited (contract can always pay out)",
         pattern: "Vault solvency",
-        invariantCode: `assertGe(address(vault).balance, vault.${totalVar.name}())`,
+        invariantCode: `assertGe(address(${lcName}).balance, ${lcName}.${totalVar.name}())`,
       });
     }
   }
@@ -224,7 +226,8 @@ function detectBalanceInvariants(contract, invariants) {
         sc.target.includes("Balance") ||
         sc.target.includes("deposit")
     );
-    if (modifiesBalance && fn.requires.length === 0 && !fn.isConstructor) {
+    if (modifiesBalance && fn.requires.length === 0 && !fn.isConstructor &&
+        fn.visibility !== "internal" && fn.visibility !== "private") {
       invariants.push({
         id: `unchecked_balance_mod_${fn.name}`,
         severity: HIGH,
@@ -253,7 +256,7 @@ function detectAccessControlInvariants(contract, invariants) {
     (f) =>
       !f.isConstructor &&
       f.stateChanges.length > 0 &&
-      f.visibility === "public" &&
+      (f.visibility === "public" || f.visibility === "external") &&
       !f.modifiers.some((m) => ownerModifiers.includes(m))
   );
 
@@ -392,7 +395,8 @@ function detectReentrancy(contract, vulns) {
 function detectUncheckedReturn(contract, vulns) {
   for (const fn of contract.functions) {
     for (const call of fn.externalCalls) {
-      if (call.type === "send") {
+      // Only flag send() when return value is not captured (unchecked)
+      if (call.type === "send" && !call.isReturnCaptured) {
         vulns.push({
           id: `unchecked_send_${fn.name}`,
           severity: HIGH,
@@ -413,7 +417,7 @@ function detectMissingAccessControl(contract, vulns) {
   const sensitiveFnNames = ["mint", "burn", "pause", "unpause", "withdraw", "setOwner", "transferOwnership", "upgrade", "selfdestruct", "destroy"];
 
   for (const fn of contract.functions) {
-    if (fn.isConstructor || fn.visibility !== "public") continue;
+    if (fn.isConstructor || (fn.visibility !== "public" && fn.visibility !== "external")) continue;
     const isSensitive = sensitiveFnNames.some((s) => fn.name.toLowerCase().includes(s));
     const hasAccessControl = fn.modifiers.some((m) => ownerModifiers.includes(m));
     const hasRequireOwner = fn.requires.some((r) =>
@@ -475,6 +479,237 @@ function detectDenialOfService(contract, vulns) {
   }
 }
 
+// ─── Gas Optimization Detection ───
+function detectGasIssues(contract) {
+  const issues = [];
+  detectNonIndexedEvents(contract, issues);
+  detectImmutableCandidates(contract, issues);
+  detectCalldataParams(contract, issues);
+  return issues;
+}
+
+function detectNonIndexedEvents(contract, issues) {
+  for (const event of contract.events) {
+    const indexedCount = event.params.filter((p) => p.isIndexed).length;
+    const indexable = event.params.filter(
+      (p) =>
+        !p.isIndexed &&
+        ["address", "uint256", "uint128", "uint64", "uint32", "uint16", "uint8",
+         "int256", "int128", "bytes32", "bool"].includes(p.type)
+    );
+    if (indexable.length > 0 && indexedCount < 3) {
+      const canIndex = Math.min(indexable.length, 3 - indexedCount);
+      issues.push({
+        id: `gas_event_index_${event.name}`,
+        title: `Add indexed to ${event.name} event parameters`,
+        description: `${event.name} has ${indexable.length} param(s) that could be indexed for cheaper log filtering`,
+        savings: "~375 gas saved per indexed param when filtering logs",
+        fix: `Add indexed keyword to: ${indexable.slice(0, canIndex).map((p) => p.name).join(", ")}`,
+      });
+    }
+  }
+}
+
+function detectImmutableCandidates(contract, issues) {
+  const ctorFn = contract.functions.find((f) => f.isConstructor);
+  if (!ctorFn) return;
+  const otherFns = contract.functions.filter((f) => !f.isConstructor);
+
+  for (const sv of contract.stateVars) {
+    if (sv.isDeclaredConst || sv.isImmutable || sv.isMapping) continue;
+    if (sv.typeName.startsWith("mapping") || sv.typeName.endsWith("[]")) continue;
+    // string and bytes cannot be immutable in most Solidity versions
+    if (sv.typeName === "string" || sv.typeName === "bytes") continue;
+
+    const setInCtor = ctorFn.stateChanges.some((sc) => sc.target === sv.name);
+    const modifiedElsewhere = otherFns.some((fn) =>
+      fn.stateChanges.some((sc) => sc.target === sv.name)
+    );
+
+    if (setInCtor && !modifiedElsewhere) {
+      issues.push({
+        id: `gas_immutable_${sv.name}`,
+        title: `Use immutable for ${sv.name}`,
+        description: `${sv.name} is only set in constructor and never modified afterward`,
+        savings: "~2100 gas saved per read (SLOAD replaced by code copy)",
+        fix: `Declare as: ${sv.typeName} public immutable ${sv.name}`,
+      });
+    }
+  }
+}
+
+function detectCalldataParams(contract, issues) {
+  for (const fn of contract.functions) {
+    // Only external functions can safely use calldata (public may be called internally)
+    if (fn.visibility !== "external") continue;
+    for (const param of fn.params) {
+      if (param.type.endsWith("[]") || param.type === "string" || param.type === "bytes") {
+        issues.push({
+          id: `gas_calldata_${fn.name}_${param.name}`,
+          title: `Use calldata for ${param.name} in ${fn.name}()`,
+          description: `${param.name} (${param.type}) can use calldata instead of memory`,
+          savings: "~600+ gas saved (avoids memory copy)",
+          fix: `Change parameter to: ${param.type} calldata ${param.name}`,
+        });
+      }
+    }
+  }
+}
+
+// ─── Security Score ───
+function calculateSecurityScore(vulns) {
+  let score = 100;
+  const deductions = [];
+
+  for (const v of vulns) {
+    let pts = 0;
+    if (v.severity === CRITICAL) pts = 25;
+    else if (v.severity === HIGH) pts = 15;
+    else if (v.severity === MEDIUM) pts = 8;
+    else if (v.severity === LOW) pts = 3;
+
+    score -= pts;
+    deductions.push({ pts, title: v.title, severity: v.severity });
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let grade;
+  if (score >= 95) grade = "A+";
+  else if (score >= 90) grade = "A";
+  else if (score >= 80) grade = "B";
+  else if (score >= 70) grade = "C";
+  else if (score >= 60) grade = "D";
+  else grade = "F";
+
+  return { score, grade, deductions };
+}
+
+function formatSecurityScore(scoreData) {
+  const { score, grade, deductions } = scoreData;
+
+  const gradeColor =
+    grade.startsWith("A") ? chalk.green.bold :
+    grade === "B" ? chalk.cyan.bold :
+    grade === "C" ? chalk.yellow.bold :
+    grade === "D" ? chalk.red.bold :
+    chalk.red.bold;
+
+  const barLen = 30;
+  const filled = Math.round((score / 100) * barLen);
+  const barColor = score >= 80 ? chalk.green : score >= 60 ? chalk.yellow : chalk.red;
+  const bar = barColor("█".repeat(filled)) + chalk.gray("░".repeat(barLen - filled));
+
+  const lines = [];
+  lines.push("");
+  lines.push(`  ${chalk.bold.white("Security Score:")} ${gradeColor(grade)} ${chalk.white(`(${score}/100)`)}`);
+  lines.push(`  ${bar}`);
+
+  if (deductions.length > 0) {
+    lines.push("");
+    for (const d of deductions) {
+      const sevColor =
+        d.severity === CRITICAL ? chalk.red :
+        d.severity === HIGH ? chalk.yellow :
+        d.severity === MEDIUM ? chalk.blue :
+        chalk.gray;
+      lines.push(`    ${sevColor(`-${d.pts}`)}  ${d.title}`);
+    }
+  } else {
+    lines.push(`  ${chalk.green("No vulnerabilities detected!")}`);
+  }
+
+  return lines.join("\n");
+}
+
+function formatGasIssues(issues, contractName) {
+  const lines = [];
+  lines.push(chalk.bold.magenta(`\n  Gas Optimization for ${contractName}`));
+  lines.push(chalk.gray(`  Found ${issues.length} optimization opportunities\n`));
+
+  for (const issue of issues) {
+    lines.push(`  ${chalk.magenta.bold("[GAS]")} ${chalk.white.bold(issue.title)}`);
+    lines.push(`    ${chalk.gray(">")} ${issue.description}`);
+    lines.push(`    ${chalk.gray("Savings:")} ${chalk.green(issue.savings)}`);
+    lines.push(`    ${chalk.green("Fix:")} ${issue.fix}`);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// ─── Markdown Report ───
+function generateMarkdownReport(contractName, invariants, vulns, gasIssues, scoreData) {
+  const lines = [];
+  const date = new Date().toISOString().split("T")[0];
+
+  lines.push(`# Sol-Shield Security Report`);
+  lines.push("");
+  lines.push(`| Field | Value |`);
+  lines.push(`|-------|-------|`);
+  lines.push(`| Contract | ${contractName} |`);
+  lines.push(`| Date | ${date} |`);
+  lines.push(`| Security Score | **${scoreData.grade}** (${scoreData.score}/100) |`);
+  lines.push(`| Invariants | ${invariants.length} |`);
+  lines.push(`| Vulnerabilities | ${vulns.length} |`);
+  lines.push(`| Gas Optimizations | ${gasIssues.length} |`);
+  lines.push("");
+
+  // Vulnerabilities
+  if (vulns.length > 0) {
+    lines.push(`## Vulnerabilities`);
+    lines.push("");
+    lines.push(`| Severity | Issue | Line | Pattern | Fix |`);
+    lines.push(`|----------|-------|------|---------|-----|`);
+    for (const v of vulns) {
+      lines.push(`| ${v.severity} | ${v.title} | ${v.line || "-"} | ${v.pattern} | ${v.fix} |`);
+    }
+    lines.push("");
+  }
+
+  // Invariants
+  if (invariants.length > 0) {
+    lines.push(`## Invariant Properties`);
+    lines.push("");
+    lines.push(`| Severity | Property | Pattern | Assertion |`);
+    lines.push(`|----------|----------|---------|-----------|`);
+    for (const inv of invariants) {
+      lines.push(`| ${inv.severity} | ${inv.title} | ${inv.pattern} | ${inv.invariantCode || "Manual check needed"} |`);
+    }
+    lines.push("");
+  }
+
+  // Gas
+  if (gasIssues.length > 0) {
+    lines.push(`## Gas Optimizations`);
+    lines.push("");
+    lines.push(`| Issue | Savings | Fix |`);
+    lines.push(`|-------|---------|-----|`);
+    for (const g of gasIssues) {
+      lines.push(`| ${g.title} | ${g.savings} | ${g.fix} |`);
+    }
+    lines.push("");
+  }
+
+  // Score breakdown
+  if (scoreData.deductions.length > 0) {
+    lines.push(`## Score Breakdown`);
+    lines.push("");
+    lines.push(`Starting score: 100`);
+    lines.push("");
+    for (const d of scoreData.deductions) {
+      lines.push(`- **-${d.pts}** ${d.severity}: ${d.title}`);
+    }
+    lines.push("");
+    lines.push(`**Final Score: ${scoreData.score}/100 (${scoreData.grade})**`);
+    lines.push("");
+  }
+
+  lines.push("---");
+  lines.push(`*Generated by [sol-shield](https://github.com/xka0085-byte/sol-shield) v0.1.0*`);
+
+  return lines.join("\n");
+}
+
 // ─── Output Formatting ───
 function formatInvariants(invariants, contractName) {
   const lines = [];
@@ -524,7 +759,12 @@ function formatVulnerabilities(vulns, contractName) {
 module.exports = {
   discoverInvariants,
   detectVulnerabilities,
+  detectGasIssues,
+  calculateSecurityScore,
   formatInvariants,
   formatVulnerabilities,
+  formatGasIssues,
+  formatSecurityScore,
+  generateMarkdownReport,
   CRITICAL, HIGH, MEDIUM, LOW,
 };

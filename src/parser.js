@@ -110,7 +110,7 @@ function analyzeBody(body, fn) {
   }
 }
 
-function walkExprForExternalCalls(expr, stmt, fn) {
+function walkExprForExternalCalls(expr, stmt, fn, isReturnCaptured = false) {
   if (!expr) return;
   // Direct: addr.call(...)
   if (expr.type === "FunctionCall" && expr.expression) {
@@ -125,6 +125,7 @@ function walkExprForExternalCalls(expr, stmt, fn) {
         fn.externalCalls.push({
           type: member,
           loc: stmt.loc,
+          isReturnCaptured,
         });
       }
     }
@@ -157,6 +158,7 @@ function walkStatement(stmt, fn) {
           fn.externalCalls.push({
             type: member,
             loc: stmt.loc,
+            isReturnCaptured: false,
           });
         }
       }
@@ -169,11 +171,27 @@ function walkStatement(stmt, fn) {
         loc: stmt.loc,
       });
     }
+    // Detect unary state changes: i++, i--, ++i, --i
+    if (expr.type === "UnaryOperation" && ["++", "--"].includes(expr.operator)) {
+      fn.stateChanges.push({
+        target: argToString(expr.subExpression),
+        operator: expr.operator,
+        loc: stmt.loc,
+      });
+    }
+    // Detect delete: delete balances[addr]
+    if (expr.type === "UnaryOperation" && expr.operator === "delete") {
+      fn.stateChanges.push({
+        target: argToString(expr.subExpression),
+        operator: "delete",
+        loc: stmt.loc,
+      });
+    }
   }
 
   // Detect external calls in variable declarations: (bool success, ) = addr.call{value: x}("")
   if (stmt.type === "VariableDeclarationStatement" && stmt.initialValue) {
-    walkExprForExternalCalls(stmt.initialValue, stmt, fn);
+    walkExprForExternalCalls(stmt.initialValue, stmt, fn, true);
   }
 
   // Recurse into blocks
@@ -184,8 +202,21 @@ function walkStatement(stmt, fn) {
     walkStatement(stmt.trueBody, fn);
     if (stmt.falseBody) walkStatement(stmt.falseBody, fn);
   }
-  if (stmt.type === "ForStatement" || stmt.type === "WhileStatement") {
+  if (stmt.type === "ForStatement" || stmt.type === "WhileStatement" || stmt.type === "DoWhileStatement") {
     walkStatement(stmt.body, fn);
+  }
+  // Recurse into try/catch blocks
+  if (stmt.type === "TryStatement") {
+    walkStatement(stmt.body, fn);
+    if (stmt.catchClauses) {
+      for (const clause of stmt.catchClauses) {
+        walkStatement(clause.body, fn);
+      }
+    }
+  }
+  // Recurse into unchecked blocks
+  if (stmt.type === "UncheckedStatement" && stmt.block) {
+    walkStatement(stmt.block, fn);
   }
 }
 

@@ -32,6 +32,16 @@ function generateInvariantTest(contract, invariants) {
   const name = contract.name;
   const lines = [];
 
+  // Collect ghost vars to know what needs initialization
+  const ghostVars = new Map();
+  for (const inv of invariants) {
+    if (inv.ghostVars) {
+      for (const g of inv.ghostVars) {
+        ghostVars.set(g.name, g);
+      }
+    }
+  }
+
   lines.push(`// SPDX-License-Identifier: MIT`);
   lines.push(`pragma solidity ^0.8.20;`);
   lines.push(``);
@@ -54,6 +64,26 @@ function generateInvariantTest(contract, invariants) {
   lines.push(`    function setUp() public {`);
   lines.push(...getSetupLines(contract));
   lines.push(`        handler = new ${name}Handler(target);`);
+
+  // Initialize ghost_balanceSum for ERC20 tokens (constructor mints initial supply)
+  if (ghostVars.has("ghost_balanceSum")) {
+    const supplyVar = contract.stateVars.find(
+      (v) => v.name === "totalSupply" || v.name === "_totalSupply"
+    );
+    if (supplyVar) {
+      lines.push(`        // Initialize ghost to match initial supply from constructor`);
+      lines.push(`        handler.initGhostBalanceSum(target.${supplyVar.name}());`);
+    }
+  }
+  if (ghostVars.has("ghost_totalMinted")) {
+    const supplyVar = contract.stateVars.find(
+      (v) => v.name === "totalSupply" || v.name === "_totalSupply"
+    );
+    if (supplyVar) {
+      lines.push(`        handler.initGhostTotalMinted(target.${supplyVar.name}());`);
+    }
+  }
+
   lines.push(`        targetContract(address(handler));`);
   lines.push(`    }`);
   lines.push(``);
@@ -118,9 +148,25 @@ function generateHandler(contract, invariants) {
   lines.push(`    }`);
   lines.push(``);
 
+  // Ghost variable initializers (called from setUp for initial state)
+  if (ghostVars.has("ghost_balanceSum")) {
+    lines.push(`    function initGhostBalanceSum(uint256 _val) external {`);
+    lines.push(`        ghost_balanceSum = _val;`);
+    lines.push(`    }`);
+    lines.push(``);
+  }
+  if (ghostVars.has("ghost_totalMinted")) {
+    lines.push(`    function initGhostTotalMinted(uint256 _val) external {`);
+    lines.push(`        ghost_totalMinted = _val;`);
+    lines.push(`    }`);
+    lines.push(``);
+  }
+
   // Generate handler functions for each public/external function
   for (const fn of contract.functions) {
     if (fn.isConstructor || fn.visibility === "internal" || fn.visibility === "private") continue;
+    // Skip special functions that can't be called directly
+    if (fn.name === "receive" || fn.name === "fallback" || fn.name === "") continue;
     lines.push(generateHandlerFunction(contract, fn, ghostVars));
     lines.push(``);
   }
@@ -166,12 +212,12 @@ function generateHandlerFunction(contract, fn, ghostVars) {
     lines.push(`        deal(currentActor, value);`);
   }
 
-  // Ghost variable tracking
+  // Collect ghost update lines for this function
+  const ghostUpdates = [];
   for (const [gName, g] of ghostVars) {
     if (g.trackIn && g.trackIn.includes(fn.name)) {
-      if (gName.includes("balanceSum") || gName.includes("totalMinted")) {
-        lines.push(`        // Track ${gName} - update based on actual state change`);
-      }
+      const update = getGhostUpdate(gName, fn);
+      if (update) ghostUpdates.push(update);
     }
   }
 
@@ -182,13 +228,63 @@ function generateHandlerFunction(contract, fn, ghostVars) {
   } else {
     lines.push(`        try target.${fn.name}${valueStr}() {`);
   }
-  lines.push(`            // Call succeeded`);
-  lines.push(`        } catch {`);
-  lines.push(`            // Call reverted - expected for invalid inputs`);
-  lines.push(`        }`);
+  // Update ghost variables on success
+  if (ghostUpdates.length > 0) {
+    for (const u of ghostUpdates) {
+      lines.push(`            ${u}`);
+    }
+  }
+  lines.push(`        } catch {}`);
   lines.push(`    }`);
 
   return lines.join("\n");
+}
+
+function getGhostUpdate(gName, fn) {
+  const name = fn.name.toLowerCase();
+  const isPayable = fn.stateMutability === "payable";
+  const amountParam = fn.params.find(
+    (p) => p.type === "uint256" && (p.name === "amount" || p.name === "_amount" || p.name === "value")
+  );
+  const amountVar = amountParam ? amountParam.name : null;
+
+  if (gName === "ghost_balanceSum") {
+    // Payable deposit/stake: add the ETH value sent
+    if (isPayable) return `ghost_balanceSum += value;`;
+    // Withdraw/unstake/burn: subtract the amount
+    if (name.includes("withdraw") || name.includes("unstake") || name.includes("burn")) {
+      return amountVar ? `ghost_balanceSum -= ${amountVar};` : null;
+    }
+    // Mint: add the amount
+    if (name.includes("mint") || name === "_mint") {
+      return amountVar ? `ghost_balanceSum += ${amountVar};` : null;
+    }
+    // Transfer: no change to total sum
+    return null;
+  }
+
+  if (gName === "ghost_totalMinted") {
+    if (name.includes("mint")) {
+      return amountVar ? `ghost_totalMinted += ${amountVar};` : null;
+    }
+    return null;
+  }
+
+  if (gName === "ghost_senderDecrease") {
+    if (name.includes("transfer")) {
+      return amountVar ? `ghost_senderDecrease += ${amountVar};` : null;
+    }
+    return null;
+  }
+
+  if (gName === "ghost_receiverIncrease") {
+    if (name.includes("transfer")) {
+      return amountVar ? `ghost_receiverIncrease += ${amountVar};` : null;
+    }
+    return null;
+  }
+
+  return null;
 }
 
 function generateInvariantFunction(contract, inv) {
@@ -235,10 +331,15 @@ function getSetupLines(contract) {
   if (constructorFn && constructorFn.params.length > 0) {
     const args = constructorFn.params.map((p) => {
       if (p.type === "string") return `"Test"`;
-      if (p.type === "uint256") return `1000000`;
-      if (p.type === "uint8") return `18`;
       if (p.type === "address") return `address(this)`;
       if (p.type === "bool") return `true`;
+      if (p.type === "uint8") return `18`;
+      if (p.type === "bytes32") return `bytes32(0)`;
+      if (p.type === "bytes4") return `bytes4(0)`;
+      if (p.type.startsWith("uint")) return `1000000`;
+      if (p.type.startsWith("int")) return `int256(0)`;
+      if (p.type === "bytes") return `""`;
+      if (p.type.endsWith("[]")) return `new ${p.type}(0)`;
       return `0`;
     });
     lines.push(`        target = new ${contract.name}(${args.join(", ")});`);
@@ -285,9 +386,15 @@ function generateVulnTest(contract, vulns) {
   if (constructorFn && constructorFn.params.length > 0) {
     const args = constructorFn.params.map((p) => {
       if (p.type === "string") return `"Test"`;
-      if (p.type === "uint256") return `1000000`;
-      if (p.type === "uint8") return `18`;
       if (p.type === "address") return `address(this)`;
+      if (p.type === "bool") return `true`;
+      if (p.type === "uint8") return `18`;
+      if (p.type === "bytes32") return `bytes32(0)`;
+      if (p.type === "bytes4") return `bytes4(0)`;
+      if (p.type.startsWith("uint")) return `1000000`;
+      if (p.type.startsWith("int")) return `int256(0)`;
+      if (p.type === "bytes") return `""`;
+      if (p.type.endsWith("[]")) return `new ${p.type}(0)`;
       return `0`;
     });
     lines.push(`        target = new ${name}(${args.join(", ")});`);
@@ -315,10 +422,17 @@ function generateAttackerContract(contract, vulns) {
   const reentrancyVulns = vulns.filter((v) => v.id.includes("reentrancy"));
   const lines = [];
 
+  // Find the deposit/stake function for the attacker to use
+  const depositFn = contract.functions.find(
+    (f) => (f.name === "deposit" || f.name === "stake") && f.stateMutability === "payable"
+  );
+  const depositCall = depositFn ? `target.${depositFn.name}` : null;
+
   lines.push(`contract ${name}Attacker {`);
   lines.push(`    ${name} public target;`);
   lines.push(`    uint256 public attackCount;`);
   lines.push(`    uint256 public maxAttacks = 3;`);
+  lines.push(`    uint256 public depositAmount;`);
   lines.push(``);
   lines.push(`    constructor(${name} _target) {`);
   lines.push(`        target = _target;`);
@@ -327,7 +441,11 @@ function generateAttackerContract(contract, vulns) {
 
   for (const v of reentrancyVulns) {
     lines.push(`    function attack_${v.function}() external payable {`);
-    lines.push(`        target.${v.function}${getAttackArgs(contract, v.function)};`);
+    if (depositCall) {
+      lines.push(`        depositAmount = msg.value;`);
+      lines.push(`        ${depositCall}{value: msg.value}();`);
+    }
+    lines.push(`        target.${v.function}${getAttackArgsFixed(contract, v.function)};`);
     lines.push(`    }`);
     lines.push(``);
   }
@@ -336,7 +454,7 @@ function generateAttackerContract(contract, vulns) {
   lines.push(`        if (attackCount < maxAttacks) {`);
   lines.push(`            attackCount++;`);
   for (const v of reentrancyVulns) {
-    lines.push(`            try target.${v.function}${getAttackArgs(contract, v.function)} {} catch {}`);
+    lines.push(`            try target.${v.function}${getAttackArgsFixed(contract, v.function)} {} catch {}`);
   }
   lines.push(`        }`);
   lines.push(`    }`);
@@ -345,23 +463,24 @@ function generateAttackerContract(contract, vulns) {
   return lines.join("\n");
 }
 
-function getAttackArgs(contract, fnName) {
+function getAttackArgsFixed(contract, fnName) {
   const fn = contract.functions.find((f) => f.name === fnName);
   if (!fn) return "()";
 
   if (fn.params.length === 0) {
-    return fn.stateMutability === "payable" ? "{value: msg.value}()" : "()";
+    return fn.stateMutability === "payable" ? "{value: depositAmount}()" : "()";
   }
 
   const args = fn.params.map((p) => {
-    if (p.type === "uint256") return "address(this).balance";
+    if (p.type === "uint256") return "depositAmount";
     if (p.type === "address") return "address(this)";
     return "0";
   });
 
-  const valueStr = fn.stateMutability === "payable" ? "{value: msg.value}" : "";
+  const valueStr = fn.stateMutability === "payable" ? "{value: depositAmount}" : "";
   return `${valueStr}(${args.join(", ")})`;
 }
+
 
 function generateVulnTestFunction(contract, vuln) {
   const lines = [];
@@ -370,31 +489,29 @@ function generateVulnTestFunction(contract, vuln) {
     lines.push(`    /// @notice Test: ${vuln.title}`);
     lines.push(`    /// ${vuln.description}`);
     lines.push(`    function test_${vuln.id}() public {`);
-    lines.push(`        // Setup: Give the contract some ETH`);
+    lines.push(`        // Setup: Give user1 some ETH and deposit into the contract`);
     lines.push(`        deal(address(user1), 10 ether);`);
     lines.push(`        vm.startPrank(user1);`);
 
     // Find deposit function
     const depositFn = contract.functions.find(
-      (f) => f.name === "deposit" || f.stateMutability === "payable"
+      (f) => (f.name === "deposit" || f.name === "stake") && f.stateMutability === "payable"
     );
     if (depositFn) {
       lines.push(`        target.${depositFn.name}{value: 5 ether}();`);
     }
     lines.push(`        vm.stopPrank();`);
     lines.push(``);
-    lines.push(`        // Attack: Attacker deposits and tries to re-enter`);
-    lines.push(`        deal(address(attacker), 2 ether);`);
+    lines.push(`        // Attack: Attacker deposits 1 ETH, then exploits reentrancy to drain more`);
+    lines.push(`        deal(address(attacker), 1 ether);`);
     lines.push(`        uint256 contractBalBefore = address(target).balance;`);
+    lines.push(`        attacker.attack_${vuln.function}{value: 1 ether}();`);
     lines.push(``);
-    lines.push(`        // If reentrancy exists, attacker drains more than deposited`);
-    lines.push(`        // This test should FAIL if the vulnerability exists`);
-    lines.push(`        // (meaning the contract IS vulnerable)`);
-    lines.push(`        vm.expectRevert(); // Remove this if you want to see the attack succeed`);
-    lines.push(`        attacker.attack_${vuln.function}();`);
-    lines.push(``);
-    lines.push(`        // Verify contract solvency`);
-    lines.push(`        // assertGe(address(target).balance, contractBalBefore - 2 ether);`);
+    lines.push(`        // If vulnerable: attacker drained more than their 1 ETH deposit`);
+    lines.push(`        uint256 attackerBal = address(attacker).balance;`);
+    lines.push(`        // This assertion PASSES if the contract IS vulnerable (attacker profits)`);
+    lines.push(`        // Fix the contract, then this test should FAIL`);
+    lines.push(`        assertGt(attackerBal, 1 ether, "Reentrancy: attacker should have drained extra ETH");`);
     lines.push(`    }`);
   } else if (vuln.id.includes("missing_access")) {
     lines.push(`    /// @notice Test: ${vuln.title}`);
@@ -440,12 +557,21 @@ function mapType(solType) {
     uint32: "uint32",
     uint8: "uint8",
     int256: "int256",
+    int128: "int128",
     bool: "bool",
     string: "string memory",
     bytes: "bytes memory",
     bytes32: "bytes32",
+    bytes4: "bytes4",
   };
-  return typeMap[solType] || solType;
+  if (typeMap[solType]) return typeMap[solType];
+  // Array types always need memory qualifier
+  if (solType.endsWith("[]")) return `${solType} memory`;
+  // Mapping types (shouldn't appear in params but handle gracefully)
+  if (solType.startsWith("mapping")) return solType;
+  // User-defined types (structs, enums) need memory if they're reference types
+  // For safety, add memory to unknown types that aren't value types
+  return solType;
 }
 
 module.exports = { generateFoundryTests };
