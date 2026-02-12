@@ -366,30 +366,86 @@ function detectVulnerabilities(contract) {
 }
 
 function detectReentrancy(contract, vulns) {
+  const stateVarNames = contract.stateVars.map((v) => v.name);
+
   for (const fn of contract.functions) {
     if (fn.externalCalls.length === 0) continue;
+    let found = false;
 
     // Check if external call happens before state changes
     for (const call of fn.externalCalls) {
+      if (found) break;
       const callLine = call.loc ? call.loc.start.line : 0;
-      const stateChangesAfter = fn.stateChanges.filter(
-        (sc) => sc.loc && sc.loc.start.line > callLine
-      );
 
-      if (stateChangesAfter.length > 0) {
+      // Filter: only include actual state variable modifications (not local vars)
+      const stateChangesAfter = fn.stateChanges.filter((sc) => {
+        if (!sc.loc || sc.loc.start.line <= callLine) return false;
+        return isStateVarChange(sc.target, stateVarNames, fn.localVars || []);
+      });
+
+      // Cross-function: check internal calls after the external call
+      const crossFnChanges = [];
+      if (fn.internalCalls) {
+        for (const ic of fn.internalCalls) {
+          if (!ic.loc || ic.loc.start.line <= callLine) continue;
+          const calledFn = contract.functions.find((f) => f.name === ic.name);
+          if (!calledFn) continue;
+          const realChanges = calledFn.stateChanges.filter((sc) =>
+            isStateVarChange(sc.target, stateVarNames, calledFn.localVars || [])
+          );
+          if (realChanges.length > 0) {
+            crossFnChanges.push({
+              fnName: ic.name,
+              targets: realChanges.map((c) => c.target),
+              loc: ic.loc,
+            });
+          }
+        }
+      }
+
+      if (stateChangesAfter.length > 0 || crossFnChanges.length > 0) {
+        let desc = `External call (${call.type}) at line ${callLine} occurs BEFORE state updates`;
+        if (stateChangesAfter.length > 0) {
+          desc += ` at line(s) ${stateChangesAfter.map((s) => s.loc.start.line).join(", ")}`;
+        }
+        if (crossFnChanges.length > 0) {
+          const crossDesc = crossFnChanges
+            .map((c) => `${c.fnName}()`)
+            .join(", ");
+          desc += `${stateChangesAfter.length > 0 ? " and" : ""} via internal call(s) to ${crossDesc}`;
+        }
+        desc += `. An attacker can re-enter this function before state is updated.`;
+
         vulns.push({
           id: `reentrancy_${fn.name}`,
           severity: CRITICAL,
           title: `Reentrancy in ${fn.name}()`,
-          description: `External call (${call.type}) at line ${callLine} occurs BEFORE state updates at line(s) ${stateChangesAfter.map((s) => s.loc.start.line).join(", ")}. An attacker can re-enter this function before state is updated.`,
+          description: desc,
           pattern: "Reentrancy (SWC-107)",
           function: fn.name,
           line: callLine,
           fix: "Move state changes before the external call (Checks-Effects-Interactions pattern), or use a reentrancy guard",
         });
+        found = true;
       }
     }
   }
+}
+
+/**
+ * Check if an assignment target is a state variable (not a local variable)
+ */
+function isStateVarChange(target, stateVarNames, localVars) {
+  // Mapping/array access is always a state change (e.g., balances[msg.sender])
+  if (target.includes("[")) return true;
+  // If the base name matches a known local variable, it's not a state change
+  const baseName = target.split(".")[0];
+  if (localVars.includes(baseName)) return false;
+  // If it matches a known state variable, it's a state change
+  if (stateVarNames.includes(baseName)) return true;
+  // Function params are also local — but we don't track them in localVars yet
+  // Default: assume it could be a state change (conservative)
+  return true;
 }
 
 function detectUncheckedReturn(contract, vulns) {

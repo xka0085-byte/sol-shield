@@ -94,6 +94,8 @@ function extractFunction(node, source) {
     requires: [],
     externalCalls: [],
     stateChanges: [],
+    internalCalls: [],
+    localVars: (node.parameters || []).filter((p) => p.name).map((p) => p.name),
     loc: node.loc,
   };
 
@@ -147,6 +149,14 @@ function walkStatement(stmt, fn) {
         const args = (expr.arguments || []).map(argToString);
         fn.requires.push({ type: callName, args });
       }
+      // Detect internal function calls (not require/revert/assert/emit, not external calls)
+      if (expr.expression.type === "Identifier" &&
+          !["require", "revert", "assert"].includes(callName)) {
+        fn.internalCalls.push({
+          name: callName,
+          loc: stmt.loc,
+        });
+      }
       // Detect external calls: addr.call, addr.transfer, addr.send
       let callExpr = expr.expression;
       if (callExpr && callExpr.type === "NameValueExpression" && callExpr.expression) {
@@ -190,8 +200,16 @@ function walkStatement(stmt, fn) {
   }
 
   // Detect external calls in variable declarations: (bool success, ) = addr.call{value: x}("")
-  if (stmt.type === "VariableDeclarationStatement" && stmt.initialValue) {
-    walkExprForExternalCalls(stmt.initialValue, stmt, fn, true);
+  if (stmt.type === "VariableDeclarationStatement") {
+    // Track local variable names to distinguish from state variables
+    if (stmt.variables) {
+      for (const v of stmt.variables) {
+        if (v && v.name) fn.localVars.push(v.name);
+      }
+    }
+    if (stmt.initialValue) {
+      walkExprForExternalCalls(stmt.initialValue, stmt, fn, true);
+    }
   }
 
   // Recurse into blocks
